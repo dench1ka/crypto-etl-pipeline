@@ -1,0 +1,111 @@
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.0
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-airflow/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: utc
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Installed at container startup so the base apache/airflow image can be
+    # used as-is (no custom Dockerfile) while extract/transform tasks still
+    # have psycopg2 + requests available. Fine for local/dev use.
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-psycopg2-binary==2.9.9 requests==2.32.3}
+    # Warehouse connection used by scripts/db.py (extract/validate/transform/load_dim).
+    WAREHOUSE_DB_HOST: postgres-warehouse
+    WAREHOUSE_DB_PORT: 5432
+    WAREHOUSE_DB_NAME: warehouse
+    WAREHOUSE_DB_USER: warehouse
+    WAREHOUSE_DB_PASSWORD: warehouse
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./scripts:/opt/airflow/scripts
+    - ./sql:/opt/airflow/sql
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres-airflow:
+      condition: service_healthy
+    postgres-warehouse:
+      condition: service_healthy
+
+services:
+  postgres-airflow:
+    image: postgres:15
+    container_name: postgres-airflow
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  postgres-warehouse:
+    image: postgres:15
+    container_name: postgres-warehouse
+    environment:
+      POSTGRES_USER: warehouse
+      POSTGRES_PASSWORD: warehouse
+      POSTGRES_DB: warehouse
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_warehouse_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "warehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-airflow}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}" \
+          --firstname Air \
+          --lastname Flow \
+          --role Admin \
+          --email admin@example.com || true
+        python /opt/airflow/scripts/init_warehouse.py
+
+  airflow:
+    <<: *airflow-common
+    container_name: airflow
+    # LocalExecutor runs tasks in-process, so scheduler + webserver share
+    # this single "airflow" container (webserver runs in the foreground).
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - "airflow scheduler & exec airflow webserver"
+    ports:
+      - "8080:8080"
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+volumes:
+  postgres_airflow_data:
+  postgres_warehouse_data:
